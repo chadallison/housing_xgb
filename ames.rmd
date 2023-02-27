@@ -1,0 +1,336 @@
+---
+title: "xgboost with tidymodels"
+output: github_document
+---
+
+### setup
+
+```{r message = F, warning = F}
+library(tidyverse)
+library(tidymodels)
+library(AmesHousing)
+library(janitor)
+library(tvthemes)
+options(scipen = 999)
+
+theme_custom = theme_avatar() +
+  theme(plot.title = element_text(hjust = 0.5),
+        panel.grid.major = element_line(linewidth = 0.5, colour = "#D6D0C4"),
+        panel.grid.minor = element_line(linewidth = 0.5, colour = "#D6D0C4"))
+
+theme_set(theme_custom)
+
+all_cores = parallel::detectCores(logical = F)
+doParallel::registerDoParallel(cores = all_cores)
+```
+
+___
+
+### loading data
+
+```{r}
+ames_data = clean_names(make_ames())
+paste0("data dimensions: ", nrow(ames_data), " rows, ", ncol(ames_data), " columns")
+```
+
+___
+
+### visualizing distribution of target variable (`sale_price`)
+
+```{r}
+ames_data |>
+  ggplot(aes(sale_price)) +
+  geom_histogram(bins = 30, col = "black", fill = "#BDADC2") +
+  scale_x_continuous(labels = scales::dollar_format()) +
+  labs(x = "sale price", y = "count",
+       title = "distribution of sale prices")
+```
+
+___
+
+### visualizing sales geographically
+
+```{r}
+ames_data |>
+  ggplot(aes(longitude, latitude)) +
+  geom_point(aes(col = sale_price), alpha = 0.5) +
+  scale_color_continuous(low = "springgreen4", high = "indianred3",
+                         labels = scales::dollar_format()) +
+  labs(col = "sale price", title = "map of sales colored by sale price") +
+  theme(legend.position = "right") 
+```
+
+___
+
+### visualizing relationship between sale price and overall quality
+
+```{r}
+ames_data |>
+  ggplot(aes(overall_qual, sale_price)) +
+  geom_boxplot(aes(fill = overall_qual), show.legend = F) +
+  coord_flip() +
+  scale_y_continuous(labels = scales::dollar_format()) +
+  labs(y = "sale price", x = "overall quality",
+       title = "boxplots of sale prices by house quality")
+```
+
+___
+
+### data splitting
+
+```{r}
+ames_split = initial_split(ames_data, prop = 0.75, strata = sale_price)
+train_data = training(ames_split)
+test_data = testing(ames_split)
+
+paste0("training data: ", nrow(train_data), " rows, ", ncol(train_data), " columns")
+paste0("testing data: ", nrow(test_data), " rows, ", ncol(test_data), " columns")
+```
+
+___
+
+### data preprocessing
+
+```{r}
+pre_recipe = recipe(sale_price ~ ., data = train_data) |>
+  # remove longitude and latitude as predictors
+  update_role(longitude, latitude, new_role = "ID") |>
+  # convert categorical variables to factor
+  step_string2factor(all_nominal()) |>
+  # combine low-frequency factor levels
+  step_other(all_nominal(), threshold = 0.01) |>
+  # remove predictors with zero variance
+  step_nzv(all_nominal()) |>
+  prep()
+
+pre_recipe
+```
+
+___
+
+### example of `step_other()` preprocessing step
+
+```{r}
+prepped_data = bake(pre_recipe, new_data = train_data)
+
+prepped_data |>
+  count(neighborhood) |>
+  mutate(x = ifelse(neighborhood == "other", "other", "normal")) |>
+  ggplot(aes(reorder(neighborhood, n), n)) +
+  geom_col(aes(fill = x), show.legend = F) +
+  scale_fill_manual(values = c("#AFC2AD", "#BDADC2")) +
+  coord_flip() +
+  labs(x = NULL, y = "count",
+       title = "neighborhood counts after data preprocessing")
+```
+
+___
+
+### creating cross-validation folds
+
+```{r}
+cv_folds = vfold_cv(prepped_data, v = 8)
+cv_folds
+```
+
+___
+
+### creating xgboost model specification
+
+```{r}
+xgb_model = boost_tree(trees = 1000, min_n = tune(), tree_depth = tune(),
+           learn_rate = tune(), loss_reduction = tune()) |>
+  set_engine("xgboost") |>
+  set_mode("regression")
+
+xgb_model
+```
+
+___
+
+### specifying tuning grid
+
+```{r}
+xgb_params = parameters(min_n(), tree_depth(), learn_rate(), loss_reduction())
+xgb_params
+```
+
+___
+
+### setting up grid space
+
+```{r}
+xgb_grid = grid_max_entropy(xgb_params, size = 60)
+glimpse(xgb_grid)
+```
+
+___
+
+### creating model workflow
+
+```{r}
+xgb_wf = workflow() |>
+  add_model(xgb_model) |>
+  add_formula(sale_price ~ .)
+
+xgb_wf
+```
+
+___
+
+### tuning the model
+
+```{r}
+xgb_tuned = tune_grid(object = xgb_wf, resamples = cv_folds, grid = xgb_grid,
+                      metrics = metric_set(rmse, rsq, mae), control = control_grid(verbose = T))
+
+xgb_tuned
+```
+
+___
+
+### getting best hyperparameters
+
+```{r}
+xgb_tuned |>
+  show_best(metric = "rmse")
+```
+
+___
+
+### isolating and finalizing best performing hyperparameter values
+
+```{r}
+xgb_best_params = xgb_tuned |>
+  select_best("rmse")
+
+xgb_model_final = xgb_model |>
+  finalize_model(xgb_best_params)
+
+xgb_model_final
+```
+
+___
+
+### evaluating model performance on training data
+
+```{r}
+train_prediction = xgb_model_final |>
+  fit(formula = sale_price ~ ., data = prepped_data) |>
+  predict(new_data = prepped_data) |>
+  bind_cols(prepped_data)
+
+xgb_score_train = train_prediction |>
+  metrics(sale_price, .pred) |>
+  mutate(.estimate = round(.estimate, 3))
+
+xgb_score_train
+```
+
+___
+
+### evaluating model performance on testing data
+
+```{r}
+test_processed = bake(pre_recipe, new_data = test_data)
+
+test_prediction = xgb_model_final |>
+  fit(formula = sale_price ~ ., data = prepped_data) |>
+  predict(new_data = test_processed) |>
+  bind_cols(test_data)
+
+xgb_score = test_prediction |>
+  metrics(sale_price, .pred) |>
+  mutate(.estimate = round(.estimate, 3))
+
+xgb_score
+```
+
+___
+
+### evaluating predictions; no apparent trends
+
+```{r}
+pred_resid = test_prediction |>
+  mutate(resid_pct = (sale_price - .pred) / .pred) |>
+  select(.pred, resid_pct)
+
+pred_resid |>
+  ggplot(aes(.pred, resid_pct)) +
+  geom_point(col = "#728670") +
+  labs(x = "predicted sale price", y = "residual (%)",
+       title = "residuals by predicted sale price") +
+  scale_x_continuous(labels = scales::dollar_format()) +
+  scale_y_continuous(labels = scales::percent)
+```
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
